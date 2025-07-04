@@ -72,7 +72,7 @@ def upload_apk():
     try:
         logger.info("Upload request started")
 
-        # العثور على ملف .apk من أي حقل
+        # البحث عن ملف ينتهي بـ .apk من أي حقل
         apk_file = None
         for field_name, file in request.files.items():
             if file and file.filename.lower().endswith(".apk"):
