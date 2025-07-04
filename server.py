@@ -123,7 +123,7 @@ def upload_apk():
             return jsonify(error="No smali files generated"), 500
 
         zip_path = os.path.join(job_dir, "smali_out.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, _, files in os.walk(out_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
