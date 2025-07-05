@@ -183,6 +183,40 @@ def assemble_smali():
         logger.exception("Unhandled error in assemble_smali")
         return jsonify(error=str(e)), 500
 
+@app.route("/inject-dex", methods=["POST"])
+def inject_dex():
+    try:
+        dex_file = request.files.get('dex')
+        main_activity = request.form.get('main_activity')
+        
+        # ... (التحقق من المدخلات)
+        
+        job_dir = os.path.join(UPLOAD_DIR, f"injectjob_{uuid.uuid4()}")
+        os.makedirs(job_dir, exist_ok=True)
+        
+        # حفظ الملفات المؤقتة
+        dex_path = os.path.join(job_dir, "classes.dex")
+        dex_file.save(dex_path)
+        output_dex_path = os.path.join(job_dir, "classes_new.dex")
+        
+        # استدعاء السكربت
+        result = subprocess.run([
+            "python", "dex_injector.py",
+            "--dex", dex_path,
+            "--output", output_dex_path,
+            "--main-activity", main_activity
+        ], capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return jsonify(error=result.stderr), 500
+        
+        # إرجاع ملف DEX الجديد
+        return send_file(output_dex_path, as_attachment=True, download_name="classes.dex")
+    
+    except Exception as e:
+        logger.exception("Error in injection")
+        return jsonify(error=str(e)), 500
+
 # ===== فحص صحة الخادم =====
 @app.route("/health", methods=["GET"])
 def health_check():
