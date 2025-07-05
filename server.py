@@ -10,6 +10,7 @@ from datetime import datetime
 import threading
 import time
 import psutil
+import xml.etree.ElementTree as ET
 
 # ===== إعداد نظام التسجيل =====
 logging.basicConfig(
@@ -66,7 +67,102 @@ def log_response_info(response):
 def home():
     return "DEX API Server is running!", 200
 
-# ===== رفع وتفكيك APK =====
+# ===== دالة للعثور على النشاط الرئيسي =====
+def find_main_activity(manifest_path):
+    try:
+        # تحليل ملف AndroidManifest.xml
+        tree = ET.parse(manifest_path)
+        root = tree.getroot()
+        
+        # الحصول على اسم الحزمة
+        package = root.get('package')
+        
+        # البحث عن النشاط الذي يحتوي على تصفية نية LAUNCHER
+        for activity in root.iter('activity'):
+            # اسم النشاط (قد يكون مطلقًا أو نسبيًا)
+            activity_name = activity.get('{http://schemas.android.com/apk/res/android}name')
+            if activity_name is None:
+                continue
+                
+            # البحث عن تصفية النية
+            intent_filters = activity.findall('intent-filter')
+            for intent_filter in intent_filters:
+                has_main_action = False
+                has_launcher_category = False
+                
+                for action in intent_filter.findall('action'):
+                    action_name = action.get('{http://schemas.android.com/apk/res/android}name')
+                    if action_name == "android.intent.action.MAIN":
+                        has_main_action = True
+                
+                for category in intent_filter.findall('category'):
+                    category_name = category.get('{http://schemas.android.com/apk/res/android}name')
+                    if category_name == "android.intent.category.LAUNCHER":
+                        has_launcher_category = True
+                
+                if has_main_action and has_launcher_category:
+                    # إذا كان اسم النشاط نسبيًا (يبدأ بنقطة) فإننا ندمجه مع اسم الحزمة
+                    if activity_name.startswith('.'):
+                        return package + activity_name
+                    elif '.' not in activity_name:
+                        return package + '.' + activity_name
+                    return activity_name
+        
+        raise Exception("MainActivity not found in AndroidManifest.xml")
+    except Exception as e:
+        logger.error(f"Failed to find main activity: {str(e)}")
+        raise
+
+# ===== دالة لحقن الكود في ملف Smali =====
+def inject_code(smali_file, invoke_line):
+    with open(smali_file, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    modified = []
+    in_oncreate = False
+    injected = False
+    
+    # الإستراتيجية 1: الحقن بعد .prologue في onCreate
+    for line in lines:
+        modified.append(line)
+        
+        if not in_oncreate and line.strip().startswith('.method') and 'onCreate(' in line:
+            in_oncreate = True
+            continue
+        
+        if in_oncreate and not injected and line.strip() == '.prologue':
+            modified.append(f'    {invoke_line}\n')
+            injected = True
+            in_oncreate = False
+        
+        if in_oncreate and line.strip().startswith('.end method'):
+            in_oncreate = False
+    
+    # الإستراتيجية 2: الحقن بعد invoke-super
+    if not injected:
+        modified = lines.copy()
+        for i, line in enumerate(modified):
+            if 'invoke-super' in line and 'onCreate' in line:
+                modified.insert(i + 1, f'    {invoke_line}\n')
+                injected = True
+                break
+    
+    # الإستراتيجية 3: الحقن قبل نهاية الدالة
+    if not injected:
+        modified = lines.copy()
+        for i in range(len(modified)-1, -1, -1):
+            if '.end method' in modified[i]:
+                modified.insert(i, f'    {invoke_line}\n')
+                injected = True
+                break
+    
+    if not injected:
+        raise Exception("Failed to inject code in onCreate")
+    
+    with open(smali_file, 'w', encoding='utf-8') as f:
+        f.writelines(modified)
+
+# ===== رفع وتفكيك APK وحقن الحماية =====
 @app.route("/upload", methods=["POST"])
 def upload_apk():
     try:
@@ -94,6 +190,18 @@ def upload_apk():
         apk_path = os.path.join(job_dir, "input.apk")
         apk_file.save(apk_path)
 
+        # استخراج AndroidManifest.xml للعثور على النشاط الرئيسي
+        manifest_path = os.path.join(job_dir, "AndroidManifest.xml")
+        with zipfile.ZipFile(apk_path, 'r') as zip_ref:
+            if 'AndroidManifest.xml' in zip_ref.namelist():
+                zip_ref.extract('AndroidManifest.xml', job_dir)
+            else:
+                return jsonify(error="AndroidManifest.xml not found in APK"), 400
+
+        # العثور على النشاط الرئيسي
+        main_activity = find_main_activity(manifest_path)
+        logger.info(f"Main activity found: {main_activity}")
+
         dex_files = []
         with zipfile.ZipFile(apk_path, 'r') as zip_ref:
             for name in zip_ref.namelist():
@@ -118,19 +226,44 @@ def upload_apk():
             if result.returncode != 0:
                 return jsonify(error=f"DEX disassembly failed: {result.stderr}"), 500
 
-        file_count = sum(len(files) for _, _, files in os.walk(out_dir))
-        if file_count == 0:
-            return jsonify(error="No smali files generated"), 500
+        # ===== بدء عملية الحقن =====
+        # تحويل اسم النشاط الرئيسي إلى مسار ملف Smali
+        smali_path = os.path.join(out_dir, main_activity.replace('.', '/') + ".smali")
+        if not os.path.exists(smali_path):
+            # البحث في جميع المجلدات الفرعية
+            found = False
+            for root, dirs, files in os.walk(out_dir):
+                candidate = os.path.join(root, main_activity.replace('.', '/') + ".smali")
+                if os.path.exists(candidate):
+                    smali_path = candidate
+                    found = True
+                    break
+            
+            if not found:
+                return jsonify(error=f"MainActivity smali not found: {smali_path}"), 400
 
-        zip_path = os.path.join(job_dir, "smali_out.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(out_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, out_dir)
-                    zipf.write(file_path, arcname)
+        logger.info(f"Injecting protection code into: {smali_path}")
+        inject_code(smali_path, "invoke-static {p0}, Lcom/abnsafita/protection/ProtectionManager;->init(Landroid/content/Context;)V")
+        # ===== نهاية عملية الحقن =====
 
-        response = send_file(zip_path, as_attachment=True, download_name="smali_out.zip", mimetype='application/zip')
+        # ===== تجميع Smali إلى DEX =====
+        dex_output = os.path.join(job_dir, "classes.dex")
+        result = subprocess.run(
+            ["java", "-jar", SMALI_PATH, "a", out_dir, "-o", dex_output],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        if result.returncode != 0:
+            return jsonify(error=f"DEX assembly failed: {result.stderr}"), 500
+
+        # ===== إرسال ملف classes.dex =====
+        response = send_file(
+            dex_output,
+            as_attachment=True,
+            download_name="classes.dex",
+            mimetype='application/octet-stream'
+        )
         response.headers["Cache-Control"] = "no-store"
         delayed_cleanup(job_dir)
         return response
@@ -181,40 +314,6 @@ def assemble_smali():
 
     except Exception as e:
         logger.exception("Unhandled error in assemble_smali")
-        return jsonify(error=str(e)), 500
-
-@app.route("/inject-dex", methods=["POST"])
-def inject_dex():
-    try:
-        dex_file = request.files.get('dex')
-        main_activity = request.form.get('main_activity')
-        
-        # ... (التحقق من المدخلات)
-        
-        job_dir = os.path.join(UPLOAD_DIR, f"injectjob_{uuid.uuid4()}")
-        os.makedirs(job_dir, exist_ok=True)
-        
-        # حفظ الملفات المؤقتة
-        dex_path = os.path.join(job_dir, "classes.dex")
-        dex_file.save(dex_path)
-        output_dex_path = os.path.join(job_dir, "classes_new.dex")
-        
-        # استدعاء السكربت
-        result = subprocess.run([
-            "python", "dex_injector.py",
-            "--dex", dex_path,
-            "--output", output_dex_path,
-            "--main-activity", main_activity
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            return jsonify(error=result.stderr), 500
-        
-        # إرجاع ملف DEX الجديد
-        return send_file(output_dex_path, as_attachment=True, download_name="classes.dex")
-    
-    except Exception as e:
-        logger.exception("Error in injection")
         return jsonify(error=str(e)), 500
 
 # ===== فحص صحة الخادم =====
