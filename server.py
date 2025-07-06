@@ -124,7 +124,7 @@ file_manager = TempFileManager()
 # ===== Enhanced API Endpoints =====
 @app.route("/")
 def home():
-    return "🛡️ APK Protection Server - Version 4.0 | Fixed Parameter Error", 200
+    return "🛡️ APK Protection Server - Version 5.0 | Fixed Manifest Issues", 200
 
 @app.before_request
 def log_request():
@@ -155,8 +155,8 @@ def upload_apk():
         output_zip, tmpdir = process_apk(
             apk_path=apk_path,
             apktool_path=APKTOOL_PATH,
-            smali_file_path=MYAPP_SMALI_PATH,  # Fixed parameter name
-            app_class=MYAPP_CLASS             # Fixed parameter name
+            smali_file_path=MYAPP_SMALI_PATH,
+            app_class=MYAPP_CLASS
         )
 
         # Validate output
@@ -224,7 +224,7 @@ def assemble_smali():
 
         temp_apk = os.path.join(job_dir, "temp.apk")
         result = subprocess.run(
-            ["java", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"],
+            ["java", "-Xmx2G", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"],  # Increased memory
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -285,7 +285,7 @@ def health_check():
     health_status = {
         "status": "OK",
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "4.0",
+        "version": "5.0",
         "components": {}
     }
     
@@ -358,6 +358,26 @@ def resource_check():
         })
     except Exception as e:
         return jsonify(error=str(e)), 500
+
+# ===== File Inspection Endpoint =====
+@app.route("/inspect/<job_id>", methods=["GET"])
+def inspect_job(job_id):
+    """Inspect job files for debugging"""
+    job_dir = os.path.join(app.config['UPLOAD_DIR'], f"apkjob_{job_id}")
+    if not os.path.exists(job_dir):
+        return jsonify(error="Job not found"), 404
+    
+    files = []
+    for root, _, filenames in os.walk(job_dir):
+        for f in filenames:
+            fp = os.path.join(root, f)
+            files.append({
+                "path": fp,
+                "size": os.path.getsize(fp),
+                "modified": os.path.getmtime(fp)
+            })
+    
+    return jsonify(files=files)
 
 # ===== Background Services =====
 def background_cleaner():
