@@ -124,7 +124,7 @@ file_manager = TempFileManager()
 # ===== Enhanced API Endpoints =====
 @app.route("/")
 def home():
-    return "🛡️ APK Protection Server - Version 4.0 | Performance Enhanced", 200
+    return "🛡️ APK Protection Server - Version 4.0 | Fixed Parameter Error", 200
 
 @app.before_request
 def log_request():
@@ -151,12 +151,12 @@ def upload_apk():
         apk_file.save(apk_path)
         logger.info(f"💾 Saved APK: {os.path.getsize(apk_path)/(1024*1024):.2f} MB")
 
-        # Process APK
+        # Process APK with CORRECTED parameter names
         output_zip, tmpdir = process_apk(
             apk_path=apk_path,
             apktool_path=APKTOOL_PATH,
-            myapp_smali_path=MYAPP_SMALI_PATH,
-            myapp_class=MYAPP_CLASS
+            smali_file_path=MYAPP_SMALI_PATH,  # Fixed parameter name
+            app_class=MYAPP_CLASS             # Fixed parameter name
         )
 
         # Validate output
