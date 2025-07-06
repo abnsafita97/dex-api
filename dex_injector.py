@@ -31,6 +31,9 @@ def run_command(cmd, cwd=None, timeout=300):
             if "unbound prefix" in error_output:
                 logger.warning("Detected XML namespace error, attempting recovery")
                 raise RuntimeError("XML namespace error - recovery attempted")
+            elif "duplicate attribute" in error_output:
+                logger.warning("Detected duplicate attribute error")
+                raise RuntimeError("Duplicate attribute error - recovery attempted")
                 
             raise RuntimeError(f"Command error: {error_output}")
         
@@ -75,10 +78,12 @@ def fix_resource_issues(decode_dir):
             tree = ET.parse(public_xml, parser=parser)
             root = tree.getroot()
             
-            # Ensure tools namespace is defined
-            if 'tools' not in root.nsmap:
+            # Ensure tools namespace is defined (check both nsmap and attrib)
+            if 'tools' not in root.nsmap and 'xmlns:tools' not in root.attrib:
                 root.set('xmlns:tools', 'http://schemas.android.com/tools')
                 logger.info("Added missing tools namespace to public.xml")
+            elif 'xmlns:tools' in root.attrib:
+                logger.info("Tools namespace already present in public.xml")
             
             # Remove problematic elements
             for elem in root.findall(".//*[@type='c']"):
@@ -86,7 +91,7 @@ def fix_resource_issues(decode_dir):
                 
             # Add ignore attributes only if tools namespace exists
             for elem in root.findall(".//public"):
-                if 'tools' in root.nsmap:
+                if 'tools' in root.nsmap or 'xmlns:tools' in root.attrib:
                     elem.set('tools:ignore', 'MissingTranslation')
                 else:
                     logger.warning("Skipping tools:ignore - namespace not defined")
@@ -187,10 +192,12 @@ def modify_manifest(manifest_path, app_class):
         tree = ET.parse(manifest_path, parser=parser)
         root = tree.getroot()
         
-        # Ensure tools namespace is defined
-        if 'xmlns:tools' not in root.attrib:
+        # Ensure tools namespace is defined (check both nsmap and attrib)
+        if 'tools' not in root.nsmap and 'xmlns:tools' not in root.attrib:
             root.attrib['xmlns:tools'] = 'http://schemas.android.com/tools'
             logger.info("Added missing tools namespace to manifest")
+        elif 'xmlns:tools' in root.attrib:
+            logger.info("Tools namespace already present in manifest")
         
         # Find application tag
         namespaces = {'android': 'http://schemas.android.com/apk/res/android'}
@@ -208,8 +215,11 @@ def modify_manifest(manifest_path, app_class):
         # Set custom application class
         app_tag.set('{http://schemas.android.com/apk/res/android}name', app_class)
         
-        # Add tools attributes
-        app_tag.set('{http://schemas.android.com/tools}ignore', 'HardcodedDebugMode')
+        # Add tools attributes only if namespace exists
+        if 'tools' in root.nsmap or 'xmlns:tools' in root.attrib:
+            app_tag.set('{http://schemas.android.com/tools}ignore', 'HardcodedDebugMode')
+        else:
+            logger.warning("Skipping tools:ignore in manifest - namespace not defined")
         
         # Save modifications
         tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
@@ -279,19 +289,33 @@ def process_apk(apk_path, apktool_path, smali_file_path, app_class):
         try:
             run_command(build_cmd, timeout=600)
         except RuntimeError as e:
-            if "XML namespace error" in str(e):
+            if "XML namespace error" in str(e) or "Duplicate attribute error" in str(e):
                 logger.warning("Resource error detected, attempting recovery")
                 
-                # Remove potentially problematic public.xml
+                # Remove potentially problematic files
                 public_xml = os.path.join(decode_dir, "res", "values", "public.xml")
+                manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
+                
                 if os.path.exists(public_xml):
-                    logger.info(f"Removing problematic file: {public_xml}")
+                    logger.info(f"Removing potentially problematic file: {public_xml}")
                     os.remove(public_xml)
                     
-                    # Retry build
-                    run_command(build_cmd, timeout=600)
-                else:
-                    raise
+                # Remove duplicate tools namespace from manifest
+                try:
+                    tree = ET.parse(manifest_path)
+                    root = tree.getroot()
+                    
+                    # Remove duplicate tools namespace if exists
+                    if root.attrib.get('xmlns:tools') and 'xmlns:tools' in root.attrib:
+                        del root.attrib['xmlns:tools']
+                    
+                    tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
+                    logger.info("Cleaned duplicate tools namespace from manifest")
+                except Exception as manifest_fix_error:
+                    logger.error(f"Failed to fix manifest: {str(manifest_fix_error)}")
+                
+                # Retry build
+                run_command(build_cmd, timeout=600)
             else:
                 raise
         
