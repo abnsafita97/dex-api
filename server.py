@@ -9,9 +9,11 @@ import time
 import psutil
 import tempfile
 import shutil
+import subprocess
+import zipfile
 from dex_injector import process_apk
 
-# ===== إعداد نظام التسجيل =====
+# ===== إعداد النظام =====
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -19,11 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== تعريف التطبيق والتهيئة =====
 app = Flask(__name__)
 UPLOAD_DIR = tempfile.gettempdir()
-MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB
-app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # مسارات الأدوات
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,73 +31,43 @@ APKTOOL_PATH = os.path.join(BASE_DIR, "apktool.jar")
 MYAPP_SMALI_PATH = os.path.join(BASE_DIR, "MyApp.smali")
 MYAPP_CLASS = "com.abnsafita.protection.MyApp"
 
-# ===== وظيفة لتنظيف المجلدات المؤقتة =====
-def delayed_cleanup(directory, delay=5):
-    """تنظيف مجلد بعد تأخير (بالثواني)"""
+# ===== وظائف المساعدة =====
+def delayed_cleanup(directory, delay=120):
+    """تنظيف مجلد بعد تأخير طويل (120 ثانية)"""
     def cleanup():
-        logger.info(f"Waiting {delay} seconds before cleaning {directory}")
+        logger.info(f"الانتظار {delay} ثانية قبل التنظيف: {directory}")
         time.sleep(delay)
         try:
             if os.path.exists(directory):
                 shutil.rmtree(directory, ignore_errors=True)
-                logger.info(f"Cleaned up directory: {directory}")
+                logger.info(f"تم التنظيف: {directory}")
         except Exception as e:
-            logger.error(f"Cleanup failed: {str(e)}")
+            logger.error(f"فشل التنظيف: {str(e)}")
     threading.Thread(target=cleanup, daemon=True).start()
 
-# ===== سجلات النظام =====
-logger.info("Starting server with configuration:")
-logger.info("Base directory: %s", BASE_DIR)
-logger.info("Files: %s", os.listdir(BASE_DIR))
-logger.info("apktool exists: %s", os.path.exists(APKTOOL_PATH))
-logger.info("MyApp.smali exists: %s", os.path.exists(MYAPP_SMALI_PATH))
-
-# ===== طلبات واستجابات =====
-@app.before_request
-def log_request_info():
-    logger.debug("Request: %s %s", request.method, request.url)
-    logger.debug("Headers: %s", dict(request.headers))
-    logger.debug("Files: %s", list(request.files.keys()))
-
-@app.after_request
-def log_response_info(response):
-    logger.debug("Response status: %s", response.status)
-    return response
-
-# ===== الصفحة الرئيسية =====
+# ===== نقاط النهاية =====
 @app.route("/")
 def home():
-    return "APK Protection Server is running!", 200
+    return "خادم حماية APK - الإصدار 3.0", 200
 
-# ===== رفع وتفكيك APK وإضافة حماية =====
 @app.route("/upload", methods=["POST"])
 def upload_apk():
     job_dir = None
     tmpdir = None
     try:
-        logger.info("Upload request started")
-
         # البحث عن ملف APK
-        apk_file = None
-        for field_name, file in request.files.items():
-            if file and file.filename.lower().endswith(".apk"):
-                apk_file = file
-                logger.info(f"Found APK file in field: {field_name}")
-                break
+        apk_file = next((f for f in request.files.values() if f.filename.lower().endswith(".apk")), None)
+        if not apk_file:
+            return jsonify(error="لم يتم العثور على ملف APK"), 400
 
-        if apk_file is None:
-            logger.error("No file with .apk extension was found")
-            return jsonify(error="No file ending with .apk was found"), 400
-
+        # إنشاء مجلد العمل
         job_id = str(uuid.uuid4())
         job_dir = os.path.join(UPLOAD_DIR, f"apkjob_{job_id}")
         os.makedirs(job_dir, exist_ok=True)
-
         apk_path = os.path.join(job_dir, "input.apk")
         apk_file.save(apk_path)
-        logger.info(f"Saved APK to: {apk_path}")
 
-        # استدعاء العملية الرئيسية من dex_injector
+        # معالجة APK
         output_zip, tmpdir = process_apk(
             apk_path=apk_path,
             apktool_path=APKTOOL_PATH,
@@ -105,181 +75,130 @@ def upload_apk():
             myapp_class=MYAPP_CLASS
         )
 
-        # إرسال الحزمة
+        # التحقق من وجود الملف قبل الإرسال
+        if not os.path.exists(output_zip):
+            logger.error(f"ملف الإخراج غير موجود: {output_zip}")
+            raise FileNotFoundError("فشل إنشاء ملف الإخراج")
+
+        # إرسال الملف
         response = send_file(
             output_zip,
             as_attachment=True,
             download_name="protected.zip",
             mimetype='application/zip'
         )
-        response.headers["Cache-Control"] = "no-store"
         
-        # تنظيف المجلدات المؤقتة بعد تأخير
-        if tmpdir:
-            delayed_cleanup(tmpdir)
-        if job_dir:
-            delayed_cleanup(job_dir)
+        # جدولة التنظيف بعد وقت كافٍ
+        if tmpdir: 
+            delayed_cleanup(tmpdir, delay=120)
+        if job_dir: 
+            delayed_cleanup(job_dir, delay=120)
             
         return response
 
     except Exception as e:
-        # في حالة الخطأ، نظف المجلدات فورًا
-        if tmpdir:
+        # تنظيف فوري في حالة الخطأ
+        if tmpdir: 
             shutil.rmtree(tmpdir, ignore_errors=True)
-        if job_dir:
+        if job_dir: 
             shutil.rmtree(job_dir, ignore_errors=True)
             
-        logger.exception("Unhandled error in upload_apk")
+        logger.exception("خطأ في تحميل APK")
         return jsonify(error=str(e)), 500
 
-# ===== تجميع ملفات Smali إلى DEX =====
 @app.route("/assemble", methods=["POST"])
 def assemble_smali():
     job_dir = None
     try:
-        logger.info("Assemble request started")
-
         if 'smali' not in request.files:
-            logger.error("Missing 'smali' field")
-            return jsonify(error="'smali' field is required"), 400
+            return jsonify(error="الحقل 'smali' مطلوب"), 400
 
-        smali_zip = request.files['smali']
-
+        # إنشاء مجلد العمل
         job_id = str(uuid.uuid4())
         job_dir = os.path.join(UPLOAD_DIR, f"assemblejob_{job_id}")
         os.makedirs(job_dir, exist_ok=True)
-
+        
+        # حفظ ملف ZIP
         zip_path = os.path.join(job_dir, "smali.zip")
-        smali_zip.save(zip_path)
-
+        request.files['smali'].save(zip_path)
+        
+        # استخراج الملفات
         smali_dir = os.path.join(job_dir, "smali")
-        os.makedirs(smali_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(smali_dir)
 
-        # تجميع Smali إلى DEX باستخدام apktool
-        # إنشاء هيكل APK مؤقت للتجميع
+        # تجميع Smali إلى DEX
         temp_apk_dir = os.path.join(job_dir, "temp_apk")
         os.makedirs(temp_apk_dir, exist_ok=True)
-        
-        # نقل مجلد smali إلى الهيكل المؤقت
         shutil.move(smali_dir, os.path.join(temp_apk_dir, "smali"))
         
-        # تجميع APK مؤقت
         temp_apk = os.path.join(job_dir, "temp.apk")
         subprocess.run(
             ["java", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"],
             check=True
         )
         
-        # استخراج classes.dex من APK المؤقت
+        # استخراج DEX
         dex_output = os.path.join(job_dir, "classes.dex")
         with zipfile.ZipFile(temp_apk, 'r') as apk_zip:
             for file in apk_zip.namelist():
                 if file.startswith("classes") and file.endswith(".dex"):
-                    # استخراج أول ملف DEX فقط (أو يمكنك تعديله لاستخراج جميع الملفات)
                     apk_zip.extract(file, job_dir)
-                    extracted_path = os.path.join(job_dir, file)
-                    if file != "classes.dex":
-                        os.rename(extracted_path, dex_output)
-                    else:
-                        dex_output = extracted_path
+                    os.rename(os.path.join(job_dir, file), dex_output)
                     break
+
+        # التحقق من وجود ملف DEX قبل الإرسال
+        if not os.path.exists(dex_output):
+            raise FileNotFoundError("فشل إنشاء ملف classes.dex")
 
         response = send_file(
             dex_output, 
             as_attachment=True, 
-            download_name="classes.dex", 
-            mimetype='application/octet-stream'
+            download_name="classes.dex"
         )
-        delayed_cleanup(job_dir)
+        
+        # جدولة التنظيف
+        delayed_cleanup(job_dir, delay=120)
         return response
 
     except Exception as e:
-        # في حالة الخطأ، نظف المجلد فورًا
-        if job_dir:
+        if job_dir: 
             shutil.rmtree(job_dir, ignore_errors=True)
-            
-        logger.exception("Unhandled error in assemble_smali")
+        logger.exception("خطأ في تجميع Smali")
         return jsonify(error=str(e)), 500
 
-# ===== فحص صحة الخادم =====
+# ===== نقاط فحص النظام =====
 @app.route("/health", methods=["GET"])
 def health_check():
-    try:
-        return jsonify({
-            "status": "OK",
-            "server_time": datetime.utcnow().isoformat(),
-            "message": "Server is operational"
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "ERROR",
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+    return jsonify(
+        status="OK", 
+        time=datetime.utcnow().isoformat(),
+        version="3.0"
+    )
 
-# ===== فحص إصدار جافا =====
 @app.route("/javacheck", methods=["GET"])
 def java_check():
     try:
         result = subprocess.run(
-            ["java", "-version"],
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            ["java", "-version"], 
+            stderr=subprocess.PIPE, 
             text=True,
-            timeout=5
+            timeout=10
         )
-        output = result.stdout + result.stderr
-        return jsonify({"status": "OK", "java_version": output.strip()})
-    except subprocess.TimeoutExpired:
-        return jsonify({"status": "ERROR", "error": "Java check timed out"}), 500
+        return jsonify(status="OK", version=result.stderr.strip())
     except Exception as e:
-        return jsonify({"status": "ERROR", "error": str(e)}), 500
+        return jsonify(status="ERROR", error=str(e)), 500
 
-# ===== فحص الموارد =====
 @app.route("/resources", methods=["GET"])
 def resource_check():
     try:
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        return jsonify({
-            "memory": {
-                "total": mem.total,
-                "available": mem.available,
-                "used": mem.used,
-                "percent": mem.percent
-            },
-            "disk": {
-                "total": disk.total,
-                "used": disk.used,
-                "free": disk.free,
-                "percent": disk.percent
-            }
-        })
+        return jsonify(
+            memory=dict(psutil.virtual_memory()._asdict()),
+            disk=dict(psutil.disk_usage('/')._asdict()),
+            cpu=psutil.cpu_percent()
+        )
     except Exception as e:
-        return jsonify({"status": "ERROR", "error": str(e)}), 500
+        return jsonify(error=str(e)), 500
 
-# ===== فحص الملفات المؤقتة =====
-@app.route("/tempfiles", methods=["GET"])
-def list_temp_files():
-    try:
-        temp_files = []
-        for f in os.listdir(UPLOAD_DIR):
-            if f.startswith("apkjob_") or f.startswith("assemblejob_"):
-                path = os.path.join(UPLOAD_DIR, f)
-                temp_files.append({
-                    "name": f,
-                    "path": path,
-                    "is_dir": os.path.isdir(path),
-                    "created": os.path.getctime(path),
-                    "modified": os.path.getmtime(path)
-                })
-        return jsonify({"status": "OK", "files": temp_files})
-    except Exception as e:
-        return jsonify({"status": "ERROR", "error": str(e)}), 500
-
-# ===== التشغيل المحلي =====
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=8080, threaded=True)
