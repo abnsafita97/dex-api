@@ -9,9 +9,11 @@ import time
 
 logger = logging.getLogger(__name__)
 
-def run_cmd(cmd, cwd=None, timeout=60):
-    """تنفيذ أمر في سطر الأوامر مع مهلة زمنية"""
+# ===== Advanced Command Execution =====
+def run_command(cmd, cwd=None, timeout=300):
+    """Execute command with robust error handling"""
     try:
+        logger.debug(f"Executing: {' '.join(cmd)}")
         result = subprocess.run(
             cmd, 
             stdout=subprocess.PIPE, 
@@ -19,119 +21,210 @@ def run_cmd(cmd, cwd=None, timeout=60):
             cwd=cwd,
             timeout=timeout
         )
+        
         if result.returncode != 0:
-            raise RuntimeError(f"فشل الأمر: {' '.join(cmd)}\n{result.stderr.decode()}")
+            error_output = result.stderr.decode().strip()
+            logger.error(f"Command failed ({result.returncode}): {error_output}")
+            raise RuntimeError(f"Command error: {error_output}")
+        
         return result.stdout.decode()
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"انتهت المهلة الزمنية للأمر: {' '.join(cmd)}")
+        logger.error(f"Timeout exceeded for command: {' '.join(cmd)}")
+        raise RuntimeError("Process timeout")
+    except Exception as e:
+        logger.error(f"Unexpected execution error: {str(e)}")
+        raise
 
-def insert_myapp(decode_dir, myapp_smali_path, myapp_class):
-    """إضافة فئة التطبيق المخصصة إلى مجلد smali المناسب"""
+# ===== Resource Issue Fixer =====
+def fix_resource_issues(decode_dir):
+    """Fix common APK resource issues"""
+    res_dir = os.path.join(decode_dir, "res")
+    if not os.path.exists(res_dir):
+        return
+
+    # Fix public.xml issues
+    public_xml = os.path.join(res_dir, "values", "public.xml")
+    if os.path.exists(public_xml):
+        try:
+            ET.register_namespace('tools', "http://schemas.android.com/tools")
+            tree = ET.parse(public_xml)
+            root = tree.getroot()
+            
+            # Remove problematic elements
+            for elem in root.findall(".//*[@type='c']"):
+                root.remove(elem)
+                
+            # Add ignore attributes
+            for elem in root.findall(".//public"):
+                elem.set('tools:ignore', 'MissingTranslation')
+            
+            tree.write(public_xml, encoding='utf-8', xml_declaration=True)
+            logger.info("Fixed public.xml")
+        except Exception as e:
+            logger.warning(f"Failed to fix public.xml: {str(e)}")
+
+# ===== Smali Injection =====
+def inject_application(decode_dir, smali_file_path, app_class):
+    """Inject custom application class"""
     try:
-        # تحديد مجلد smali الرئيسي
-        smali_dir = os.path.join(decode_dir, "smali")
-        if not os.path.exists(smali_dir):
-            for dir_name in os.listdir(decode_dir):
-                if dir_name.startswith("smali"):
-                    smali_dir = os.path.join(decode_dir, dir_name)
-                    break
-            else:
-                raise RuntimeError("لم يتم العثور على مجلد smali في APK المفكك")
+        # Find all smali directories
+        smali_dirs = [
+            os.path.join(decode_dir, d) 
+            for d in os.listdir(decode_dir) 
+            if d.startswith("smali")
+        ]
         
-        # تحويل اسم الفئة إلى مسار
-        class_path = myapp_class.replace(".", "/")
+        if not smali_dirs:
+            raise RuntimeError("No smali directories found")
+        
+        # Convert class to path
+        class_path = app_class.replace(".", "/")
         if class_path.endswith(".smali"):
             class_path = class_path[:-6]
         
-        # إنشاء مسار الوجهة
-        app_dir = os.path.join(smali_dir, os.path.dirname(class_path))
-        class_name = os.path.basename(class_path)
-        dest_path = os.path.join(app_dir, f"{class_name}.smali")
+        # Prepare target directory
+        class_parts = class_path.split("/")
+        class_name = class_parts[-1]
+        relative_path = "/".join(class_parts[:-1])
         
-        # إنشاء المجلدات ونسخ الملف
-        os.makedirs(app_dir, exist_ok=True)
-        shutil.copy(myapp_smali_path, dest_path)
+        # Inject into first smali directory (can be extended to multi-dex)
+        target_dir = os.path.join(smali_dirs[0], relative_path)
+        os.makedirs(target_dir, exist_ok=True)
+        target_file = os.path.join(target_dir, f"{class_name}.smali")
         
-        logger.info(f"✅ تمت إضافة MyApp.smali إلى {dest_path}")
+        # Copy application file
+        shutil.copy(smali_file_path, target_file)
+        
+        if not os.path.exists(target_file):
+            raise RuntimeError("File copy failed")
+        
+        logger.info(f"✅ Injected application to: {target_file}")
         return True
     except Exception as e:
-        logger.error(f"خطأ في إضافة الفئة المخصصة: {str(e)}")
+        logger.error(f"❌ Injection failed: {str(e)}")
         return False
 
-def modify_manifest(manifest_path):
-    """تعديل AndroidManifest.xml"""
+# ===== Manifest Modification =====
+def modify_manifest(manifest_path, app_class):
+    """Modify AndroidManifest.xml"""
     try:
-        # التحقق من وجود الملف
+        # Validate manifest
         if not os.path.exists(manifest_path):
-            raise FileNotFoundError(f"الملف غير موجود: {manifest_path}")
+            raise FileNotFoundError(f"Missing file: {manifest_path}")
         
-        # تحليل XML
+        # Register namespaces
         ET.register_namespace('android', "http://schemas.android.com/apk/res/android")
-        tree = ET.parse(manifest_path)
+        ET.register_namespace('tools', "http://schemas.android.com/tools")
+        
+        # Parse XML
+        parser = ET.XMLParser(target=ET.TreeBuilder(), encoding="utf-8")
+        tree = ET.parse(manifest_path, parser=parser)
         root = tree.getroot()
         
-        # البحث عن وسم التطبيق
-        app_tag = None
-        for elem in root.iter():
-            if elem.tag == 'application':
-                app_tag = elem
-                break
+        # Find application tag
+        namespaces = {'android': 'http://schemas.android.com/apk/res/android'}
+        app_tag = root.find('application', namespaces=namespaces)
+        
         if app_tag is None:
-            raise RuntimeError("لم يتم العثور على وسم <application> في AndroidManifest.xml")
+            # Alternative search
+            for elem in root.iter():
+                if 'application' in elem.tag:
+                    app_tag = elem
+                    break
+            if app_tag is None:
+                raise RuntimeError("Application tag not found")
         
-        # إضافة/تعديل سمة android:name
-        app_tag.set('{http://schemas.android.com/apk/res/android}name', 'com.abnsafita.protection.MyApp')
+        # Set custom application class
+        app_tag.set('{http://schemas.android.com/apk/res/android}name', app_class)
         
-        # حفظ التعديلات
+        # Add tools attributes
+        app_tag.set('{http://schemas.android.com/tools}ignore', 'HardcodedDebugMode')
+        
+        # Save modifications
         tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
-        logger.info("✅ تم تعديل المانيفست بنجاح")
+        logger.info("✅ Manifest modified successfully")
         return True
+    except ET.ParseError as e:
+        logger.error(f"❌ XML parse error: {str(e)}")
+        return False
     except Exception as e:
-        logger.error(f"خطأ في تعديل المانيفست: {str(e)}")
+        logger.error(f"❌ Manifest modification failed: {str(e)}")
         return False
 
-def process_apk(apk_path, apktool_path, myapp_smali_path, myapp_class):
-    """معالجة APK الرئيسية"""
-    # إنشاء مجلد مؤقت يدويًا
+# ===== APK Processing Pipeline =====
+def process_apk(apk_path, apktool_path, smali_file_path, app_class):
+    """Main APK processing workflow"""
+    # Create temp workspace
     tmpdir = tempfile.mkdtemp()
+    logger.info(f"📁 Temp workspace: {tmpdir}")
+    
     try:
-        # 1. تفكيك APK
+        # Step 1: Decode APK
         decode_dir = os.path.join(tmpdir, "decoded")
-        logger.info(f"تفكيك APK إلى: {decode_dir}")
-        run_cmd(["java", "-jar", apktool_path, "d", apk_path, "-o", decode_dir, "-f"], timeout=300)
+        logger.info(f"🔧 Decoding APK to: {decode_dir}")
         
-        # 2. تعديل AndroidManifest.xml
+        decode_cmd = [
+            "java", "-jar", apktool_path, "d",
+            "--use-aapt2",  # Use modern resource compiler
+            "--force",      # Force overwrite
+            apk_path,
+            "-o", decode_dir
+        ]
+        run_command(decode_cmd, timeout=600)
+        
+        # Step 2: Fix resource issues
+        fix_resource_issues(decode_dir)
+        
+        # Step 3: Modify manifest
         manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
-        if not modify_manifest(manifest_path):
-            raise RuntimeError("فشل تعديل المانيفست")
+        if not modify_manifest(manifest_path, app_class):
+            raise RuntimeError("Manifest modification failed")
         
-        # 3. إضافة MyApp.smali
-        if not insert_myapp(decode_dir, myapp_smali_path, myapp_class):
-            raise RuntimeError("فشل إضافة الفئة المخصصة")
+        # Step 4: Inject application class
+        if not inject_application(decode_dir, smali_file_path, app_class):
+            raise RuntimeError("Application injection failed")
         
-        # 4. إعادة تجميع APK
+        # Step 5: Rebuild APK
         output_apk = os.path.join(tmpdir, "protected.apk")
-        logger.info(f"إعادة تجميع APK إلى: {output_apk}")
-        run_cmd(["java", "-jar", apktool_path, "b", decode_dir, "-o", output_apk, "-f"], timeout=300)
+        logger.info(f"🔧 Rebuilding APK to: {output_apk}")
         
-        # 5. إنشاء حزمة الإخراج (DEX + Manifest)
+        build_cmd = [
+            "java", "-jar", apktool_path, "b", 
+            decode_dir, 
+            "-o", output_apk
+        ]
+        run_command(build_cmd, timeout=600)
+        
+        # Step 6: Create output package
         output_zip = os.path.join(tmpdir, "protected.zip")
-        with zipfile.ZipFile(output_zip, 'w') as zipf:
+        logger.info(f"📦 Creating output package: {output_zip}")
+        
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
             with zipfile.ZipFile(output_apk, 'r') as apk_zip:
+                # Add all DEX files
                 for file in apk_zip.namelist():
-                    if (file.startswith("classes") and file.endswith(".dex")) or file == "AndroidManifest.xml":
-                        extracted_path = os.path.join(tmpdir, file)
-                        apk_zip.extract(file, tmpdir)
-                        zipf.write(extracted_path, file)
-                        logger.info(f"تمت إضافة {file} إلى الإخراج")
+                    if file.startswith("classes") and file.endswith(".dex"):
+                        zipf.writestr(file, apk_zip.read(file))
+                        logger.debug(f"Added: {file}")
+                
+                # Add manifest
+                if "AndroidManifest.xml" in apk_zip.namelist():
+                    zipf.writestr("AndroidManifest.xml", apk_zip.read("AndroidManifest.xml"))
         
-        # التحقق من إنشاء الملف بنجاح
+        # Validate output
         if not os.path.exists(output_zip):
-            raise RuntimeError("فشل إنشاء ملف ZIP الناتج")
+            raise RuntimeError("Output ZIP creation failed")
         
-        logger.info(f"تم إنشاء ملف الإخراج: {output_zip} ({os.path.getsize(output_zip)} بايت)")
+        size_mb = os.path.getsize(output_zip) / (1024 * 1024)
+        logger.info(f"✅ Created output: {output_zip} ({size_mb:.2f} MB)")
         return output_zip, tmpdir
+        
     except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        logger.error(f"خطأ في process_apk: {str(e)}")
+        # Cleanup on failure
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception as cleanup_err:
+            logger.error(f"Cleanup error: {str(cleanup_err)}")
+        
+        logger.exception("❌ Critical APK processing failure")
         raise
