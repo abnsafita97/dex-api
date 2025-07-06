@@ -177,11 +177,11 @@ def process_apk(apk_path, apktool_path, smali_file_path, app_class):
         
         # Step 3: Modify manifest
         manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
-        if not modify_manifest(manifest_path, app_class):
+        if not modify_manifest(manifest_path, app_class):  # Pass app_class here
             raise RuntimeError("Manifest modification failed")
         
         # Step 4: Inject application class
-        if not inject_application(decode_dir, smali_file_path, app_class):
+        if not inject_application(decode_dir, smali_file_path, app_class):  # Pass both params
             raise RuntimeError("Application injection failed")
         
         # Step 5: Rebuild APK
