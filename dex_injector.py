@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 import tempfile
 import logging
 import time
+from xml.dom import minidom
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,12 @@ def run_command(cmd, cwd=None, timeout=300):
         if result.returncode != 0:
             error_output = result.stderr.decode().strip()
             logger.error(f"Command failed ({result.returncode}): {error_output}")
+            
+            # Special handling for resource errors
+            if "unbound prefix" in error_output:
+                logger.warning("Detected XML namespace error, attempting recovery")
+                raise RuntimeError("XML namespace error - recovery attempted")
+                
             raise RuntimeError(f"Command error: {error_output}")
         
         return result.stdout.decode()
@@ -35,9 +42,19 @@ def run_command(cmd, cwd=None, timeout=300):
         logger.error(f"Unexpected execution error: {str(e)}")
         raise
 
+# ===== XML Validation =====
+def validate_xml(xml_path):
+    """Validate XML file structure"""
+    try:
+        minidom.parse(xml_path)
+        return True
+    except Exception as e:
+        logger.error(f"Invalid XML structure: {str(e)}")
+        return False
+
 # ===== Resource Issue Fixer =====
 def fix_resource_issues(decode_dir):
-    """Fix common APK resource issues"""
+    """Fix common APK resource issues with robust error handling"""
     res_dir = os.path.join(decode_dir, "res")
     if not os.path.exists(res_dir):
         return
@@ -46,22 +63,67 @@ def fix_resource_issues(decode_dir):
     public_xml = os.path.join(res_dir, "values", "public.xml")
     if os.path.exists(public_xml):
         try:
+            # Validate XML first
+            if not validate_xml(public_xml):
+                logger.warning("Invalid XML detected, attempting repair")
+                
+            # Register namespaces
+            ET.register_namespace('android', "http://schemas.android.com/apk/res/android")
             ET.register_namespace('tools', "http://schemas.android.com/tools")
-            tree = ET.parse(public_xml)
+            
+            parser = ET.XMLParser(encoding='utf-8')
+            tree = ET.parse(public_xml, parser=parser)
             root = tree.getroot()
+            
+            # Ensure tools namespace is defined
+            if 'tools' not in root.nsmap:
+                root.set('xmlns:tools', 'http://schemas.android.com/tools')
+                logger.info("Added missing tools namespace to public.xml")
             
             # Remove problematic elements
             for elem in root.findall(".//*[@type='c']"):
                 root.remove(elem)
                 
-            # Add ignore attributes
+            # Add ignore attributes only if tools namespace exists
             for elem in root.findall(".//public"):
-                elem.set('tools:ignore', 'MissingTranslation')
+                if 'tools' in root.nsmap:
+                    elem.set('tools:ignore', 'MissingTranslation')
+                else:
+                    logger.warning("Skipping tools:ignore - namespace not defined")
             
+            # Save with proper XML declaration
             tree.write(public_xml, encoding='utf-8', xml_declaration=True)
             logger.info("Fixed public.xml")
+            
+            # Re-validate after fix
+            if not validate_xml(public_xml):
+                logger.error("XML still invalid after fix, removing tools attributes")
+                for elem in root.findall(".//public"):
+                    if 'tools:ignore' in elem.attrib:
+                        del elem.attrib['tools:ignore']
+                tree.write(public_xml, encoding='utf-8', xml_declaration=True)
+            
+            logger.info("Successfully fixed public.xml")
+            
         except Exception as e:
-            logger.warning(f"Failed to fix public.xml: {str(e)}")
+            logger.error(f"Critical error fixing public.xml: {str(e)}")
+            logger.warning("Attempting to remove problematic file")
+            try:
+                # Fallback: remove tools attributes
+                tree = ET.parse(public_xml)
+                root = tree.getroot()
+                for elem in root.findall(".//public"):
+                    if 'tools:ignore' in elem.attrib:
+                        del elem.attrib['tools:ignore']
+                tree.write(public_xml, encoding='utf-8', xml_declaration=True)
+                logger.info("Removed tools attributes from public.xml")
+            except:
+                # Final fallback: remove file completely
+                try:
+                    os.remove(public_xml)
+                    logger.warning("Deleted problematic public.xml file")
+                except Exception as e_remove:
+                    logger.error(f"Failed to delete public.xml: {str(e_remove)}")
 
 # ===== Smali Injection =====
 def inject_application(decode_dir, smali_file_path, app_class):
@@ -106,20 +168,29 @@ def inject_application(decode_dir, smali_file_path, app_class):
 
 # ===== Manifest Modification =====
 def modify_manifest(manifest_path, app_class):
-    """Modify AndroidManifest.xml"""
+    """Modify AndroidManifest.xml with namespace validation"""
     try:
         # Validate manifest
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(f"Missing file: {manifest_path}")
+        
+        # Validate XML structure
+        if not validate_xml(manifest_path):
+            logger.warning("Manifest XML is invalid, attempting repair")
         
         # Register namespaces
         ET.register_namespace('android', "http://schemas.android.com/apk/res/android")
         ET.register_namespace('tools', "http://schemas.android.com/tools")
         
         # Parse XML
-        parser = ET.XMLParser(target=ET.TreeBuilder(), encoding="utf-8")
+        parser = ET.XMLParser(encoding='utf-8')
         tree = ET.parse(manifest_path, parser=parser)
         root = tree.getroot()
+        
+        # Ensure tools namespace is defined
+        if 'xmlns:tools' not in root.attrib:
+            root.attrib['xmlns:tools'] = 'http://schemas.android.com/tools'
+            logger.info("Added missing tools namespace to manifest")
         
         # Find application tag
         namespaces = {'android': 'http://schemas.android.com/apk/res/android'}
@@ -142,6 +213,15 @@ def modify_manifest(manifest_path, app_class):
         
         # Save modifications
         tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
+        
+        # Re-validate after modification
+        if not validate_xml(manifest_path):
+            logger.error("Manifest XML still invalid after modification")
+            # Remove problematic tools attribute if needed
+            if 'tools:ignore' in app_tag.attrib:
+                del app_tag.attrib['{http://schemas.android.com/tools}ignore']
+            tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
+        
         logger.info("✅ Manifest modified successfully")
         return True
     except ET.ParseError as e:
@@ -153,7 +233,7 @@ def modify_manifest(manifest_path, app_class):
 
 # ===== APK Processing Pipeline =====
 def process_apk(apk_path, apktool_path, smali_file_path, app_class):
-    """Main APK processing workflow"""
+    """Main APK processing workflow with enhanced error recovery"""
     # Create temp workspace
     tmpdir = tempfile.mkdtemp()
     logger.info(f"📁 Temp workspace: {tmpdir}")
@@ -177,23 +257,43 @@ def process_apk(apk_path, apktool_path, smali_file_path, app_class):
         
         # Step 3: Modify manifest
         manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
-        if not modify_manifest(manifest_path, app_class):  # Pass app_class here
+        if not modify_manifest(manifest_path, app_class):
             raise RuntimeError("Manifest modification failed")
         
         # Step 4: Inject application class
-        if not inject_application(decode_dir, smali_file_path, app_class):  # Pass both params
+        if not inject_application(decode_dir, smali_file_path, app_class):
             raise RuntimeError("Application injection failed")
         
-        # Step 5: Rebuild APK
+        # Step 5: Rebuild APK with aapt2
         output_apk = os.path.join(tmpdir, "protected.apk")
         logger.info(f"🔧 Rebuilding APK to: {output_apk}")
         
         build_cmd = [
             "java", "-jar", apktool_path, "b", 
             decode_dir, 
-            "-o", output_apk
+            "-o", output_apk,
+            "--use-aapt2"  # Ensure using modern resource compiler
         ]
-        run_command(build_cmd, timeout=600)
+        
+        # Attempt build with recovery mechanism
+        try:
+            run_command(build_cmd, timeout=600)
+        except RuntimeError as e:
+            if "XML namespace error" in str(e):
+                logger.warning("Resource error detected, attempting recovery")
+                
+                # Remove potentially problematic public.xml
+                public_xml = os.path.join(decode_dir, "res", "values", "public.xml")
+                if os.path.exists(public_xml):
+                    logger.info(f"Removing problematic file: {public_xml}")
+                    os.remove(public_xml)
+                    
+                    # Retry build
+                    run_command(build_cmd, timeout=600)
+                else:
+                    raise
+            else:
+                raise
         
         # Step 6: Create output package
         output_zip = os.path.join(tmpdir, "protected.zip")
