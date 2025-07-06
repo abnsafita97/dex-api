@@ -26,11 +26,10 @@ MAX_CONTENT_LENGTH = 100 * 1024 * 1024  # 100MB
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 # مسارات الأدوات
-BAKSMALI_PATH = "/usr/local/bin/baksmali.jar"
-SMALI_PATH = "/usr/local/bin/smali.jar"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APKTOOL_PATH = os.path.join(BASE_DIR, "apktool.jar")
 MYAPP_SMALI_PATH = os.path.join(BASE_DIR, "MyApp.smali")
-MYAPP_CLASS = "com/abnsafita/protection/MyApp"
+MYAPP_CLASS = "com.abnsafita.protection.MyApp"
 
 # ===== وظيفة لتنظيف المجلدات المؤقتة =====
 def delayed_cleanup(directory, delay=30):
@@ -49,8 +48,7 @@ def delayed_cleanup(directory, delay=30):
 logger.info("Starting server with configuration:")
 logger.info("Base directory: %s", BASE_DIR)
 logger.info("Files: %s", os.listdir(BASE_DIR))
-logger.info("Baksmali exists: %s", os.path.exists(BAKSMALI_PATH))
-logger.info("Smali exists: %s", os.path.exists(SMALI_PATH))
+logger.info("apktool exists: %s", os.path.exists(APKTOOL_PATH))
 logger.info("MyApp.smali exists: %s", os.path.exists(MYAPP_SMALI_PATH))
 
 # ===== طلبات واستجابات =====
@@ -68,7 +66,7 @@ def log_response_info(response):
 # ===== الصفحة الرئيسية =====
 @app.route("/")
 def home():
-    return "DEX Protection Server is running!", 200
+    return "APK Protection Server is running!", 200
 
 # ===== رفع وتفكيك APK وإضافة حماية =====
 @app.route("/upload", methods=["POST"])
@@ -94,12 +92,12 @@ def upload_apk():
 
         apk_path = os.path.join(job_dir, "input.apk")
         apk_file.save(apk_path)
+        logger.info(f"Saved APK to: {apk_path}")
 
         # استدعاء العملية الرئيسية من dex_injector
         output_zip = process_apk(
             apk_path=apk_path,
-            baksmali_path=BAKSMALI_PATH,
-            smali_path=SMALI_PATH,
+            apktool_path=APKTOOL_PATH,
             myapp_smali_path=MYAPP_SMALI_PATH,
             myapp_class=MYAPP_CLASS
         )
@@ -143,13 +141,35 @@ def assemble_smali():
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(smali_dir)
 
+        # تجميع Smali إلى DEX باستخدام apktool
         dex_output = os.path.join(job_dir, "classes.dex")
-        subprocess.run(
-            ["java", "-jar", SMALI_PATH, "a", smali_dir, "-o", dex_output],
-            check=True
+        logger.info("Assembling Smali to DEX using apktool")
+        
+        # إنشاء هيكل APK مؤقت للتجميع
+        temp_apk_dir = os.path.join(job_dir, "temp_apk")
+        os.makedirs(temp_apk_dir, exist_ok=True)
+        
+        # نقل مجلد smali إلى الهيكل المؤقت
+        shutil.move(smali_dir, os.path.join(temp_apk_dir, "smali"))
+        
+        # تجميع APK مؤقت
+        temp_apk = os.path.join(job_dir, "temp.apk")
+        run_cmd(["java", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"])
+        
+        # استخراج classes.dex من APK المؤقت
+        with zipfile.ZipFile(temp_apk, 'r') as apk_zip:
+            for file in apk_zip.namelist():
+                if file.startswith("classes") and file.endswith(".dex"):
+                    apk_zip.extract(file, job_dir)
+                    if file != "classes.dex":
+                        os.rename(os.path.join(job_dir, file), dex_output)
+        
+        response = send_file(
+            dex_output, 
+            as_attachment=True, 
+            download_name="classes.dex", 
+            mimetype='application/octet-stream'
         )
-
-        response = send_file(dex_output, as_attachment=True, download_name="classes.dex", mimetype='application/octet-stream')
         delayed_cleanup(job_dir)
         return response
 
@@ -211,6 +231,25 @@ def resource_check():
                 "percent": disk.percent
             }
         })
+    except Exception as e:
+        return jsonify({"status": "ERROR", "error": str(e)}), 500
+
+# ===== فحص الملفات المؤقتة =====
+@app.route("/tempfiles", methods=["GET"])
+def list_temp_files():
+    try:
+        temp_files = []
+        for f in os.listdir(UPLOAD_DIR):
+            if f.startswith("apkjob_") or f.startswith("assemblejob_"):
+                path = os.path.join(UPLOAD_DIR, f)
+                temp_files.append({
+                    "name": f,
+                    "path": path,
+                    "is_dir": os.path.isdir(path),
+                    "created": os.path.getctime(path),
+                    "modified": os.path.getmtime(path)
+                })
+        return jsonify({"status": "OK", "files": temp_files})
     except Exception as e:
         return jsonify({"status": "ERROR", "error": str(e)}), 500
 
