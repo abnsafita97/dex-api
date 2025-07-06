@@ -25,6 +25,7 @@ COPY . .
 # نسخ ملفات .jar إلى مسار معروف
 COPY baksmali.jar /usr/local/bin/baksmali.jar
 COPY smali.jar /usr/local/bin/smali.jar
+COPY MyApp.smali /app/MyApp.smali
 
 # التحقق من وجود ملفات JAR
 RUN chmod +x /usr/local/bin/baksmali.jar
