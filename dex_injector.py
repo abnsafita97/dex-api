@@ -1,207 +1,95 @@
 import os
-import sys
+import shutil
+import tempfile
+import zipfile
 import subprocess
-import argparse
-import logging
 import xml.etree.ElementTree as ET
 
-# إعداد نظام التسجيل
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+MYAPP_PATH = os.path.abspath("MyApp.smali")
+MYAPP_CLASS = "com/abnsafita/protection/MyApp"
 
-# مسارات الأدوات (يمكن تعديلها)
-DEFAULT_BAKSMALI_PATH = "/usr/local/bin/baksmali.jar"
-DEFAULT_SMALI_PATH = "/usr/local/bin/smali.jar"
+def run_cmd(cmd, cwd=None):
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}\n{result.stderr.decode()}")
+    return result.stdout.decode()
 
-def find_main_activity(manifest_path):
-    """استخراج اسم النشاط الرئيسي من AndroidManifest.xml"""
-    try:
-        # تحليل ملف AndroidManifest.xml
-        tree = ET.parse(manifest_path)
-        root = tree.getroot()
+def extract_apk(apk_path, out_dir):
+    with zipfile.ZipFile(apk_path, 'r') as zip_ref:
+        zip_ref.extractall(out_dir)
 
-        # الحصول على اسم الحزمة
-        package = root.get('package')
+def rebuild_apk(src_dir, output_apk):
+    with zipfile.ZipFile(output_apk, 'w') as zipf:
+        for root, dirs, files in os.walk(src_dir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, src_dir)
+                zipf.write(full_path, rel_path)
 
-        # البحث عن النشاط الذي يحتوي على تصفية نية LAUNCHER
-        for activity in root.iter('activity'):
-            # اسم النشاط (قد يكون مطلقًا أو نسبيًا)
-            activity_name = activity.get('{http://schemas.android.com/apk/res/android}name')
-            if activity_name is None:
-                continue
+def decompile_dex(dex_path, out_dir, dex_index):
+    dex_out = os.path.join(out_dir, f"smali_classes{dex_index}" if dex_index > 1 else "smali")
+    run_cmd(f"baksmali d {dex_path} -o {dex_out}")
+    return dex_out
 
-            # البحث عن تصفية النية
-            intent_filters = activity.findall('intent-filter')
-            for intent_filter in intent_filters:
-                has_main_action = False
-                has_launcher_category = False
+def recompile_dex(smali_dir, out_dex_path):
+    run_cmd(f"smali a {smali_dir} -o {out_dex_path}")
 
-                for action in intent_filter.findall('action'):
-                    action_name = action.get('{http://schemas.android.com/apk/res/android}name')
-                    if action_name == "android.intent.action.MAIN":
-                        has_main_action = True
+def insert_myapp(smali_dir):
+    dest_path = os.path.join(smali_dir, *MYAPP_CLASS.split("/")) + ".smali"
+    if os.path.exists(dest_path):
+        print("MyApp.smali already exists in smali tree. Skipping copy.")
+        return
 
-                for category in intent_filter.findall('category'):
-                    category_name = category.get('{http://schemas.android.com/apk/res/android}name')
-                    if category_name == "android.intent.category.LAUNCHER":
-                        has_launcher_category = True
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    shutil.copy(MYAPP_PATH, dest_path)
 
-                if has_main_action and has_launcher_category:
-                    # إذا كان اسم النشاط نسبيًا (يبدأ بنقطة) فإننا ندمجه مع اسم الحزمة
-                    if activity_name.startswith('.'):
-                        return package + activity_name
-                    elif '.' not in activity_name:
-                        return package + '.' + activity_name
-                    return activity_name
+    if not os.path.exists(dest_path):
+        raise RuntimeError("Failed to copy MyApp.smali")
+    print("✅ MyApp.smali successfully copied.")
 
-        return None
-    except Exception as e:
-        logger.error(f"Failed to parse manifest: {str(e)}")
-        return None
+def modify_manifest(manifest_path):
+    ET.register_namespace('android', "http://schemas.android.com/apk/res/android")
+    tree = ET.parse(manifest_path)
+    root = tree.getroot()
+    app_tag = root.find('application')
 
-def inject_code_into_smali(smali_file_path, invoke_line):
-    """حقن كود الحماية في ملف Smali"""
-    try:
-        with open(smali_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        modified = []
-        in_oncreate = False
-        injected = False
-
-        # الإستراتيجية 1: الحقن بعد .prologue في onCreate
-        for line in lines:
-            modified.append(line)
-
-            # الدخول إلى دالة onCreate
-            if not in_oncreate and line.strip().startswith('.method') and 'onCreate(' in line:
-                in_oncreate = True
-                continue
-
-            # الحقن بعد .prologue
-            if in_oncreate and not injected and line.strip() == '.prologue':
-                modified.append(f'    {invoke_line}\n')
-                injected = True
-                in_oncreate = False
-
-            # الخروج من الدالة
-            if in_oncreate and line.strip().startswith('.end method'):
-                in_oncreate = False
-
-        # الإستراتيجية 2: الحقن بعد استدعاء invoke-super في onCreate
-        if not injected:
-            modified = lines.copy()
-            for i, line in enumerate(modified):
-                if 'invoke-super' in line and 'onCreate' in line:
-                    modified.insert(i+1, f'    {invoke_line}\n')
-                    injected = True
-                    break
-
-        # الإستراتيجية 3: الحقن قبل نهاية الدالة
-        if not injected:
-            modified = lines.copy()
-            for i in range(len(modified)-1, -1, -1):
-                if '.end method' in modified[i]:
-                    modified.insert(i, f'    {invoke_line}\n')
-                    injected = True
-                    break
-
-        if not injected:
-            raise Exception("Failed to inject code in onCreate")
-
-        # كتابة الملف المعدل
-        with open(smali_file_path, 'w', encoding='utf-8') as f:
-            f.writelines(modified)
-
-        return True
-    except Exception as e:
-        logger.error(f"Injection failed: {str(e)}")
-        return False
-
-def process_dex(dex_path, output_dex_path, main_activity_fqn, baksmali_path=None, smali_path=None):
-    """معالجة ملف DEX: تفكيك، حقن، إعادة تجميع"""
-    # استخدام المسارات الافتراضية إذا لم يتم توفيرها
-    if baksmali_path is None:
-        baksmali_path = DEFAULT_BAKSMALI_PATH
-    if smali_path is None:
-        smali_path = DEFAULT_SMALI_PATH
-
-    # إنشاء مجلد عمل مؤقت
-    work_dir = os.path.dirname(dex_path)
-    smali_dir = os.path.join(work_dir, "smali_out")
-    os.makedirs(smali_dir, exist_ok=True)
-
-    try:
-        # 1. تفكيك DEX إلى Smali
-        logger.info(f"Disassembling DEX: {dex_path}")
-        result = subprocess.run(
-            ["java", "-jar", baksmali_path, "d", dex_path, "-o", smali_dir],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            logger.error(f"Baksmali error: {result.stderr}")
-            return False
-
-        # 2. تحويل FQN إلى مسار ملف Smالي
-        smali_file_path = os.path.join(smali_dir, main_activity_fqn.replace('.', '/') + ".smali")
-        if not os.path.exists(smali_file_path):
-            logger.error(f"Smali file not found: {smali_file_path}")
-            return False
-
-        # 3. حقن الكود
-        invoke_line = "invoke-static {p0}, Lcom/abnsafita/protection/ProtectionManager;->init(Landroid/content/Context;)V"
-        logger.info(f"Injecting code into: {smali_file_path}")
-        if not inject_code_into_smali(smali_file_path, invoke_line):
-            return False
-
-        # 4. إعادة تجميع Smالي إلى DEX
-        logger.info("Assembling Smali to DEX")
-        result = subprocess.run(
-            ["java", "-jar", smali_path, "a", smali_dir, "-o", output_dex_path],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            logger.error(f"Smali assembly error: {result.stderr}")
-            return False
-
-        return True
-    except Exception as e:
-        logger.exception("Processing failed")
-        return False
-    finally:
-        # تنظيف مجلد Smali (اختياري)
-        shutil.rmtree(smali_dir, ignore_errors=True)
-
-def main():
-    parser = argparse.ArgumentParser(description='Inject protection code into DEX')
-    parser.add_argument('--dex', required=True, help='Input DEX file path')
-    parser.add_argument('--output', required=True, help='Output DEX file path')
-    parser.add_argument('--main-activity', required=True, help='Fully qualified name of main activity')
-    parser.add_argument('--baksmali', help='Path to baksmali.jar')
-    parser.add_argument('--smali', help='Path to smali.jar')
-
-    args = parser.parse_args()
-
-    success = process_dex(
-        dex_path=args.dex,
-        output_dex_path=args.output,
-        main_activity_fqn=args.main_activity,
-        baksmali_path=args.baksmali,
-        smali_path=args.smali
-    )
-
-    if success:
-        logger.info("Injection completed successfully")
-        sys.exit(0)
+    if app_tag is not None:
+        app_tag.set('{http://schemas.android.com/apk/res/android}name', 'com.abnsafita.protection.MyApp')
+        print("✅ Manifest modified.")
     else:
-        logger.error("Injection failed")
-        sys.exit(1)
+        raise RuntimeError("<application> tag not found in AndroidManifest.xml")
 
-if __name__ == "__main__":
-    main()
+    tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
+
+def process_apk(apk_path):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extract_dir = os.path.join(tmpdir, "apk")
+        os.makedirs(extract_dir, exist_ok=True)
+        extract_apk(apk_path, extract_dir)
+
+        dex_files = sorted([f for f in os.listdir(extract_dir) if f.startswith("classes") and f.endswith(".dex")])
+        smali_dirs = []
+
+        for i, dex_file in enumerate(dex_files):
+            dex_path = os.path.join(extract_dir, dex_file)
+            smali_out = decompile_dex(dex_path, tmpdir, i + 1)
+            smali_dirs.append((smali_out, dex_file))
+
+        # Inject MyApp into classes.dex only (index 0)
+        insert_myapp(smali_dirs[0][0])
+
+        # Recompile and replace all dex files
+        for smali_out, dex_filename in smali_dirs:
+            new_dex_path = os.path.join(tmpdir, f"new_{dex_filename}")
+            recompile_dex(smali_out, new_dex_path)
+            shutil.move(new_dex_path, os.path.join(extract_dir, dex_filename))
+
+        # Modify Manifest
+        manifest_path = os.path.join(extract_dir, "AndroidManifest.xml")
+        modify_manifest(manifest_path)
+
+        # Repack APK
+        patched_apk_path = os.path.join(tmpdir, "patched.apk")
+        rebuild_apk(extract_dir, patched_apk_path)
+
+        return patched_apk_path
