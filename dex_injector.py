@@ -16,11 +16,6 @@ def run_cmd(cmd, cwd=None):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr.decode()}")
     return result.stdout.decode()
 
-def extract_apk(apk_path, out_dir):
-    """استخراج محتويات APK"""
-    with zipfile.ZipFile(apk_path, 'r') as zip_ref:
-        zip_ref.extractall(out_dir)
-
 def insert_myapp(decode_dir, myapp_smali_path, myapp_class):
     """إضافة فئة التطبيق المخصصة إلى مجلد smali المناسب"""
     try:
@@ -37,8 +32,16 @@ def insert_myapp(decode_dir, myapp_smali_path, myapp_class):
                 raise RuntimeError("No smali folder found in decoded APK")
         
         # إنشاء مسار الوجهة
-        app_dir = os.path.join(smali_dir, *myapp_class.split("."))
-        dest_path = os.path.join(app_dir, "MyApp.smali")
+        # تحويل اسم الفئة إلى مسار
+        class_path = myapp_class.replace(".", "/")
+        # إذا كان الاسم يحتوي على ".smali" في النهاية، نزيله
+        if class_path.endswith(".smali"):
+            class_path = class_path[:-6]
+        
+        # الحصول على مسار المجلد واسم الفئة
+        app_dir = os.path.join(smali_dir, os.path.dirname(class_path))
+        class_name = os.path.basename(class_path)
+        dest_path = os.path.join(app_dir, f"{class_name}.smali")
         
         # إنشاء المجلدات إذا لزم الأمر
         os.makedirs(app_dir, exist_ok=True)
@@ -105,65 +108,47 @@ def modify_manifest(manifest_path):
 
 def process_apk(apk_path, apktool_path, myapp_smali_path, myapp_class):
     """معالجة APK الرئيسية باستخدام apktool فقط"""
+    # إنشاء مجلد مؤقت يدويًا
+    tmpdir = tempfile.mkdtemp()
     try:
-        # إنشاء مجلد مؤقت
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # 1. تفكيك APK باستخدام apktool
-            decode_dir = os.path.join(tmpdir, "decoded")
-            logger.info(f"Decoding APK with apktool to: {decode_dir}")
-            run_cmd(["java", "-jar", apktool_path, "d", apk_path, "-o", decode_dir, "-f"])
-            
-            # 2. تعديل AndroidManifest.xml
-            manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
-            if not modify_manifest(manifest_path):
-                raise RuntimeError("Failed to modify AndroidManifest.xml")
-            
-            # 3. إضافة MyApp.smali إلى مجلد smali المناسب
-            if not insert_myapp(decode_dir, myapp_smali_path, myapp_class):
-                raise RuntimeError("Failed to add custom application class")
-            
-            # 4. إعادة تجميع APK
-            output_apk = os.path.join(tmpdir, "protected.apk")
-            logger.info(f"Rebuilding APK with apktool to: {output_apk}")
-            run_cmd(["java", "-jar", apktool_path, "b", decode_dir, "-o", output_apk, "-f"])
-            
-            # 5. إنشاء حزمة الإخراج (DEX + Manifest)
-            output_zip = os.path.join(tmpdir, "protected.zip")
-            with zipfile.ZipFile(output_zip, 'w') as zipf:
-                # استخراج ملفات DEX وManifest من APK المعدل
-                with zipfile.ZipFile(output_apk, 'r') as apk_zip:
-                    for file in apk_zip.namelist():
-                        if file.startswith("classes") and file.endswith(".dex") or file == "AndroidManifest.xml":
-                            # استخراج الملف مؤقتاً
-                            apk_zip.extract(file, tmpdir)
-                            extracted_path = os.path.join(tmpdir, file)
-                            
-                            # إضافة الملف إلى ZIP النهائي
-                            zipf.write(extracted_path, file)
-                            logger.info(f"Added {file} to output zip")
-            
-            return output_zip
+        # 1. تفكيك APK باستخدام apktool
+        decode_dir = os.path.join(tmpdir, "decoded")
+        logger.info(f"Decoding APK with apktool to: {decode_dir}")
+        run_cmd(["java", "-jar", apktool_path, "d", apk_path, "-o", decode_dir, "-f"])
+        
+        # 2. تعديل AndroidManifest.xml
+        manifest_path = os.path.join(decode_dir, "AndroidManifest.xml")
+        if not modify_manifest(manifest_path):
+            raise RuntimeError("Failed to modify AndroidManifest.xml")
+        
+        # 3. إضافة MyApp.smali إلى مجلد smali المناسب
+        if not insert_myapp(decode_dir, myapp_smali_path, myapp_class):
+            raise RuntimeError("Failed to add custom application class")
+        
+        # 4. إعادة تجميع APK
+        output_apk = os.path.join(tmpdir, "protected.apk")
+        logger.info(f"Rebuilding APK with apktool to: {output_apk}")
+        run_cmd(["java", "-jar", apktool_path, "b", decode_dir, "-o", output_apk, "-f"])
+        
+        # 5. إنشاء حزمة الإخراج (DEX + Manifest)
+        output_zip = os.path.join(tmpdir, "protected.zip")
+        with zipfile.ZipFile(output_zip, 'w') as zipf:
+            # استخراج ملفات DEX وManifest من APK المعدل
+            with zipfile.ZipFile(output_apk, 'r') as apk_zip:
+                for file in apk_zip.namelist():
+                    if file.startswith("classes") and file.endswith(".dex") or file == "AndroidManifest.xml":
+                        # استخراج الملف مؤقتاً
+                        apk_zip.extract(file, tmpdir)
+                        extracted_path = os.path.join(tmpdir, file)
+                        
+                        # إضافة الملف إلى ZIP النهائي
+                        zipf.write(extracted_path, file)
+                        logger.info(f"Added {file} to output zip")
+        
+        # إرجاع المسار إلى الملف الناتج والمجلد المؤقت لتنظيفه لاحقًا
+        return output_zip, tmpdir
     except Exception as e:
+        # في حالة الخطأ، نظف المجلد المؤقت
+        shutil.rmtree(tmpdir, ignore_errors=True)
         logger.error(f"Error in process_apk: {str(e)}")
         raise
-
-def extract_files_from_apk(apk_path, output_dir):
-    """استخراج ملفات DEX وManifest من APK"""
-    with zipfile.ZipFile(apk_path, 'r') as zip_ref:
-        # إنشاء مجلد الإخراج
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # استخراج ملفات DEX وManifest
-        for file in zip_ref.namelist():
-            if file.startswith("classes") and file.endswith(".dex") or file == "AndroidManifest.xml":
-                zip_ref.extract(file, output_dir)
-                logger.info(f"Extracted {file} to {output_dir}")
-        
-        # التحقق من وجود ملفات
-        extracted_files = os.listdir(output_dir)
-        if not any(f.startswith("classes") for f in extracted_files):
-            raise RuntimeError("No DEX files extracted from APK")
-        if "AndroidManifest.xml" not in extracted_files:
-            raise RuntimeError("AndroidManifest.xml not found in APK")
-        
-        return output_dir
