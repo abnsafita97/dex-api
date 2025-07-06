@@ -191,14 +191,81 @@ def java_check():
 
 @app.route("/resources", methods=["GET"])
 def resource_check():
+    """فحص موارد النظام بالميغابايت (MB)"""
     try:
-        return jsonify(
-            memory=dict(psutil.virtual_memory()._asdict()),
-            disk=dict(psutil.disk_usage('/')._asdict()),
-            cpu=psutil.cpu_percent()
-        )
+        # تحويل البايت إلى ميغابايت
+        def bytes_to_mb(bytes_value):
+            return round(bytes_value / (1024 * 1024), 2)
+        
+        # الحصول على معلومات الذاكرة
+        mem = psutil.virtual_memory()
+        
+        # الحصول على معلومات الذاكرة التبادلية (Swap)
+        swap = psutil.swap_memory()
+        
+        # الحصول على معلومات القرص
+        disk = psutil.disk_usage('/')
+        
+        # الحصول على استخدام المعالج
+        cpu_percent = psutil.cpu_percent(interval=1)
+        
+        # الحصول على متوسط الحمل
+        load_avg = os.getloadavg() if hasattr(os, 'getloadavg') else None
+        
+        # الحصول على معلومات العمليات
+        processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'memory_info', 'cpu_percent']):
+            try:
+                processes.append({
+                    "pid": proc.info['pid'],
+                    "name": proc.info['name'],
+                    "memory_mb": bytes_to_mb(proc.info['memory_info'].rss),
+                    "memory_percent": round(proc.info['memory_percent'], 2),
+                    "cpu_percent": round(proc.info['cpu_percent'], 2)
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        
+        # فرز العمليات حسب استخدام الذاكرة
+        processes_sorted = sorted(processes, key=lambda x: x['memory_mb'], reverse=True)[:10]
+        
+        return jsonify({
+            "status": "OK",
+            "memory_mb": {
+                "total": bytes_to_mb(mem.total),
+                "available": bytes_to_mb(mem.available),
+                "used": bytes_to_mb(mem.used),
+                "free": bytes_to_mb(mem.free),
+                "percent": mem.percent
+            },
+            "swap_mb": {
+                "total": bytes_to_mb(swap.total),
+                "used": bytes_to_mb(swap.used),
+                "free": bytes_to_mb(swap.free),
+                "percent": swap.percent
+            },
+            "disk_mb": {
+                "total": bytes_to_mb(disk.total),
+                "used": bytes_to_mb(disk.used),
+                "free": bytes_to_mb(disk.free),
+                "percent": disk.percent
+            },
+            "cpu": {
+                "percent": cpu_percent,
+                "cores": psutil.cpu_count(logical=False),
+                "logical_cores": psutil.cpu_count(logical=True)
+            },
+            "load_average": load_avg,
+            "top_processes": processes_sorted,
+            "uptime_seconds": int(time.time() - psutil.boot_time()),
+            "server_time": datetime.utcnow().isoformat()
+        })
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify({
+            "status": "ERROR",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, threaded=True)
