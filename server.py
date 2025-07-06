@@ -32,7 +32,8 @@ MYAPP_SMALI_PATH = os.path.join(BASE_DIR, "MyApp.smali")
 MYAPP_CLASS = "com.abnsafita.protection.MyApp"
 
 # ===== وظيفة لتنظيف المجلدات المؤقتة =====
-def delayed_cleanup(directory, delay=30):
+def delayed_cleanup(directory, delay=5):
+    """تنظيف مجلد بعد تأخير (بالثواني)"""
     def cleanup():
         logger.info(f"Waiting {delay} seconds before cleaning {directory}")
         time.sleep(delay)
@@ -71,6 +72,8 @@ def home():
 # ===== رفع وتفكيك APK وإضافة حماية =====
 @app.route("/upload", methods=["POST"])
 def upload_apk():
+    job_dir = None
+    tmpdir = None
     try:
         logger.info("Upload request started")
 
@@ -95,7 +98,7 @@ def upload_apk():
         logger.info(f"Saved APK to: {apk_path}")
 
         # استدعاء العملية الرئيسية من dex_injector
-        output_zip = process_apk(
+        output_zip, tmpdir = process_apk(
             apk_path=apk_path,
             apktool_path=APKTOOL_PATH,
             myapp_smali_path=MYAPP_SMALI_PATH,
@@ -110,16 +113,29 @@ def upload_apk():
             mimetype='application/zip'
         )
         response.headers["Cache-Control"] = "no-store"
-        delayed_cleanup(job_dir)
+        
+        # تنظيف المجلدات المؤقتة بعد تأخير
+        if tmpdir:
+            delayed_cleanup(tmpdir)
+        if job_dir:
+            delayed_cleanup(job_dir)
+            
         return response
 
     except Exception as e:
+        # في حالة الخطأ، نظف المجلدات فورًا
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            
         logger.exception("Unhandled error in upload_apk")
         return jsonify(error=str(e)), 500
 
 # ===== تجميع ملفات Smali إلى DEX =====
 @app.route("/assemble", methods=["POST"])
 def assemble_smali():
+    job_dir = None
     try:
         logger.info("Assemble request started")
 
@@ -142,9 +158,6 @@ def assemble_smali():
             zip_ref.extractall(smali_dir)
 
         # تجميع Smali إلى DEX باستخدام apktool
-        dex_output = os.path.join(job_dir, "classes.dex")
-        logger.info("Assembling Smali to DEX using apktool")
-        
         # إنشاء هيكل APK مؤقت للتجميع
         temp_apk_dir = os.path.join(job_dir, "temp_apk")
         os.makedirs(temp_apk_dir, exist_ok=True)
@@ -154,16 +167,25 @@ def assemble_smali():
         
         # تجميع APK مؤقت
         temp_apk = os.path.join(job_dir, "temp.apk")
-        run_cmd(["java", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"])
+        subprocess.run(
+            ["java", "-jar", APKTOOL_PATH, "b", temp_apk_dir, "-o", temp_apk, "-f"],
+            check=True
+        )
         
         # استخراج classes.dex من APK المؤقت
+        dex_output = os.path.join(job_dir, "classes.dex")
         with zipfile.ZipFile(temp_apk, 'r') as apk_zip:
             for file in apk_zip.namelist():
                 if file.startswith("classes") and file.endswith(".dex"):
+                    # استخراج أول ملف DEX فقط (أو يمكنك تعديله لاستخراج جميع الملفات)
                     apk_zip.extract(file, job_dir)
+                    extracted_path = os.path.join(job_dir, file)
                     if file != "classes.dex":
-                        os.rename(os.path.join(job_dir, file), dex_output)
-        
+                        os.rename(extracted_path, dex_output)
+                    else:
+                        dex_output = extracted_path
+                    break
+
         response = send_file(
             dex_output, 
             as_attachment=True, 
@@ -174,6 +196,10 @@ def assemble_smali():
         return response
 
     except Exception as e:
+        # في حالة الخطأ، نظف المجلد فورًا
+        if job_dir:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            
         logger.exception("Unhandled error in assemble_smali")
         return jsonify(error=str(e)), 500
 
